@@ -1,0 +1,442 @@
+#!/usr/bin/env bash
+
+# -------------------------------------------------------------------------
+# Script Name: mediagram
+# Description:
+# This script provides an interactive terminal-based interface to search,
+# download and play YouTube videos using `yt-dlp` and `mpv.`
+#
+# Features:
+# - Search for YouTube videos or playlists with dynamic toggles.
+# - Supports audio-only or video playback modes.
+# - Shuffle and play downloaded media.
+# - Explicit handling of ALSA audio devices for proper output.
+# - Stores user preferences and settings for consistent behavior.
+#
+# Attribution:
+# Implemented via GPT by Page Telegram services for a better world.
+# Version: v1.0 
+# Date: December 2024
+# -------------------------------------------------------------------------
+
+
+STATE_FILE="./yts.dat"
+BEEP_FILE="./beep.wav" # Generated with espeak
+TOTAL_RESULTS=60
+RESULTS_PER_PAGE=15
+MAX_PAGES=4
+
+SITE="https://youtube.com"
+SEARCH_TYPE="videos"
+# QUERY=""
+TITLES=()
+URLS=()
+AUDIO_DEVICES=()
+AUDIO_DEVICE_INDEX=0
+AUDIO_ONLY_MODE=false
+PAGE=0
+CUR_INDEX=0
+
+# Dependencies required
+REQUIRED_PACKAGES=(bash yt-dlp jq mpv socat alsa-utils coreutils espeak)
+
+check_and_install_dependencies() {
+    missing_packages=()
+    for pkg in "${REQUIRED_PACKAGES[@]}"; do
+        if ! command -v "$pkg" &>/dev/null; then
+            missing_packages+=("$pkg")
+        fi
+    done
+
+    if [ ${#missing_packages[@]} -eq 0 ]; then
+        return 0 # all good
+    fi
+
+    if [ ! -f /etc/os-release ]; then
+        echo "Cannot detect distribution. Missing packages: ${missing_packages[*]}"
+        exit 1
+    fi
+
+    . /etc/os-release
+    installer_cmd=""
+    if [[ "$ID" =~ (debian|ubuntu|mint|xubuntu|lubuntu) ]]; then
+        installer_cmd="sudo apt-get install -y"
+    elif [[ "$ID" =~ (fedora|centos|rhel) ]]; then
+        if command -v dnf &>/dev/null; then
+            installer_cmd="sudo dnf install -y"
+        else
+            installer_cmd="sudo yum install -y"
+        fi
+    elif [[ "$ID" == "arch" ]]; then
+        installer_cmd="sudo pacman -Sy --noconfirm"
+    else
+        echo "Unsupported distribution $ID. Missing: ${missing_packages[*]}"
+        exit 1
+    fi
+
+    if ! $installer_cmd "${missing_packages[@]}"; then
+        echo "Failed to install required packages: ${missing_packages[*]}"
+        exit 1
+    fi
+}
+
+get_query() {
+    # If $1 (first argument) is null, prompt for input
+    if [ -z "$1" ]; then
+        while true; do
+            echo -n "Enter search query: "
+            read QUERY
+
+            # Handle playlist mode if the query starts with "p "
+            if [[ "$QUERY" =~ ^p[[:space:]]+(.*)$ ]]; then
+                local temp_query="${BASH_REMATCH[1]}"
+                SEARCH_TYPE="playlists"
+                perform_search "$temp_query" "playlists"
+            else
+                perform_search "$QUERY" "$SEARCH_TYPE"
+            fi
+
+            # Check if results were found
+            if [ "${#TITLES[@]}" -eq 0 ]; then
+                echo "No results found. Press Enter to try another query or Q to quit."
+                read -n1 ch
+                echo
+                if [[ "$ch" =~ ^[Qq]$ ]]; then
+                    save_state
+                    exit 0
+                fi
+            else
+                PAGE=0
+                break
+            fi
+        done
+    else
+        # If $1 is provided, use it as the query
+        QUERY="$1"
+        perform_search "$QUERY" "$SEARCH_TYPE"
+        if [ "${#TITLES[@]}" -eq 0 ]; then
+            echo "No results found for query: '$QUERY'. Exiting."
+            exit 1
+        fi
+        PAGE=0
+    fi
+}
+
+
+new_search_from_results() {
+    local old_TITLES=("${TITLES[@]}")
+    local old_URLS=("${URLS[@]}")
+    local old_QUERY="$QUERY"
+    local old_SITE="$SITE"
+    local old_SEARCH_TYPE="$SEARCH_TYPE"
+    local old_AUDIO_DEVICE_INDEX="$AUDIO_DEVICE_INDEX"
+    local old_AUDIO_ONLY_MODE="$AUDIO_ONLY_MODE"
+    local old_PAGE=$PAGE
+
+    stty sane
+    get_query
+    if [ "${#TITLES[@]}" -eq 0 ]; then
+        echo "No results found. Press Enter to return to previous results."
+        read
+        TITLES=("${old_TITLES[@]}")
+        URLS=("${old_URLS[@]}")
+        QUERY="$old_QUERY"
+        SITE="$old_SITE"
+        SEARCH_TYPE="$old_SEARCH_TYPE"
+        AUDIO_DEVICE_INDEX="$old_AUDIO_DEVICE_INDEX"
+        AUDIO_ONLY_MODE="$old_AUDIO_ONLY_MODE"
+        PAGE=$old_PAGE
+    fi
+
+    save_state
+    draw_results_menu
+    stty -echo -icanon time 0 min 0
+}
+
+generate_beep_file() {
+    if [ ! -f "$BEEP_FILE" ]; then
+        echo "Generating $BEEP_FILE using espeak..."
+        espeak "Shavidica" --stdout > "$BEEP_FILE"
+        if [ $? -ne 0 ]; then
+            echo "Failed to generate $BEEP_FILE. Ensure espeak is installed and working."
+            exit 1
+        fi
+    fi
+}
+
+load_state() {
+    if [ -f "$STATE_FILE" ]; then
+        while IFS='=' read -r key val; do
+            case "$key" in
+                SITE) SITE="$val" ;;
+                SEARCH_TYPE) SEARCH_TYPE="$val" ;;
+                AUDIO_DEVICE_INDEX) AUDIO_DEVICE_INDEX="$val" ;;
+                AUDIO_ONLY_MODE) AUDIO_ONLY_MODE="$val" ;;
+            esac
+        done < "$STATE_FILE"
+    fi
+}
+
+save_state() {
+    {
+        echo "SITE=$SITE"
+        echo "SEARCH_TYPE=$SEARCH_TYPE"
+        echo "AUDIO_DEVICE_INDEX=$AUDIO_DEVICE_INDEX"
+        echo "AUDIO_ONLY_MODE=$AUDIO_ONLY_MODE"
+    } > "$STATE_FILE"
+}
+
+detect_audio_devices() {
+    while IFS= read -r line; do
+        if [[ $line =~ ^card[[:space:]]+([0-9]+):.*device[[:space:]]+([0-9]+): ]]; then
+            card="${BASH_REMATCH[1]}"
+            dev="${BASH_REMATCH[2]}"
+            AUDIO_DEVICES+=("hw:${card},${dev}")
+        fi
+    done < <(aplay -l 2>/dev/null)
+
+    if [ "${#AUDIO_DEVICES[@]}" -eq 0 ]; then
+        AUDIO_DEVICES=("hw:0,0")
+    fi
+}
+
+get_audio_device_string() {
+    # Use a map for ALSA devices if "hw:X,Y" is required
+    echo "alsa/plughw:${AUDIO_DEVICES[$AUDIO_DEVICE_INDEX]#hw:}"
+}
+
+
+play_beep() {
+    local dev=$(get_audio_device_string)
+    if [ -f "$BEEP_FILE" ]; then
+        aplay -D "$dev" "$BEEP_FILE" >/dev/null 2>&1
+    fi
+}
+
+play_with_mpv() {
+    # $1: Extra arguments (like --shuffle)
+    # $2..: Files or URLs
+    local extra_args=("$1")
+    shift
+    local items=("$@")
+
+    local mpv_args=()
+
+    # Specify audio device using --audio-device
+    local audio_device="$(get_audio_device_string)"
+    mpv_args+=("--audio-device=$audio_device")
+
+    # Disable video if in audio-only mode
+    if $AUDIO_ONLY_MODE; then
+        mpv_args+=("--vid=no")
+    fi
+
+    mpv "${mpv_args[@]}" "${extra_args[@]}" "${items[@]}"
+}
+
+
+
+shuffle_and_play_downloads() {
+    if $AUDIO_ONLY_MODE; then
+        echo "Playing shuffled audio..."
+        play_with_mpv "--shuffle" ./*.mp3
+    else
+        echo "Playing shuffled video..."
+        play_with_mpv "--shuffle" ./*.mp4
+    fi
+}
+
+
+perform_search() {
+    local query="$1"
+    local search_type="$2"
+    local yt_search="ytsearch${TOTAL_RESULTS}:${query}"
+
+    yt-dlp "$yt_search" --flat-playlist --dump-json 2>/dev/null > filtered.json
+
+    mapfile -t TITLES < <(jq -r -s '.[] | .title' filtered.json)
+    mapfile -t URLS < <(jq -r -s '.[] | if .url then .url else .id end' filtered.json)
+
+    rm -f filtered.json
+
+    for i in "${!TITLES[@]}"; do
+        TITLES[$i]="${TITLES[$i]:0:200}" # Truncate titles to 200 characters
+    done
+
+    if [ "$search_type" = "playlists" ]; then
+        # Filter for YouTube playlists
+        local filtered_titles=()
+        local filtered_urls=()
+        for i in "${!TITLES[@]}"; do
+            if [[ "${URLS[$i]}" == *"list=PL"* ]]; then
+                filtered_titles+=("${TITLES[$i]}")
+                filtered_urls+=("${URLS[$i]}")
+            fi
+        done
+        TITLES=("${filtered_titles[@]}")
+        URLS=("${filtered_urls[@]}")
+    fi
+
+    play_beep
+}
+
+draw_results_menu() {
+    clear
+
+    local start_index=$((PAGE * RESULTS_PER_PAGE))
+    local end_index=$((start_index + RESULTS_PER_PAGE - 1))
+    if ((end_index >= ${#TITLES[@]})); then
+        end_index=$(( ${#TITLES[@]} - 1 ))
+    fi
+
+    local page_num=$((PAGE + 1))
+    local disp_start=0
+    local disp_end=0
+    if [ ${#TITLES[@]} -gt 0 ]; then
+        disp_start=$((start_index + 1))
+        disp_end=$((end_index + 1))
+    fi
+
+    tput setab 7; tput setaf 0
+    echo "Site: $SITE"
+    echo "Query: '$QUERY'"
+    echo "Mode (SearchType): $SEARCH_TYPE"
+    echo "Audio Device: $(get_audio_device_string)"
+    echo "Audio-only mode: $AUDIO_ONLY_MODE"
+    echo "Page $page_num, $disp_start-$disp_end"
+    echo "------------------------------------------------------------"
+    tput sgr0
+    echo "Up/Down: Navigate items | PageUp/PageDown: Navigate pages | Enter: Play | D: Download | Q: Quit"
+    echo "Tab: Toggle site | P: Toggle mode | C: Cycle audio device | S: New query"
+    echo "V: Toggle audio-only/video mode | L: Shuffle & play downloaded media"
+    echo "------------------------------------------------------------"
+
+    for (( i = start_index; i <= end_index && i < ${#TITLES[@]}; i++ )); do
+        local line="${TITLES[$i]}"
+        local display_i=$((i - start_index))
+        if [ "$display_i" -eq "$CUR_INDEX" ]; then
+            echo -e "> \e[1;32m$line\e[0m"
+        else
+            echo "  $line"
+        fi
+    done
+}
+
+results_menu() {
+    CUR_INDEX=0
+    draw_results_menu
+    stty -echo -icanon time 0 min 0
+
+    while true; do
+        IFS= read -rsn1 key
+        if [[ $key == $'\x1b' ]]; then
+            # Handle escape sequences for arrow keys and paging
+            read -rsn2 key2
+            case "$key2" in
+                "[A") # Up Arrow
+                    ((CUR_INDEX--))
+                    if ((CUR_INDEX < 0)); then CUR_INDEX=$((RESULTS_PER_PAGE - 1)); fi
+                    draw_results_menu
+                    ;;
+                "[B") # Down Arrow
+                    ((CUR_INDEX++))
+                    if ((CUR_INDEX >= RESULTS_PER_PAGE)); then CUR_INDEX=0; fi
+                    draw_results_menu
+                    ;;
+                "[5") # Page Up
+                    read -rsn1 key3
+                    if [[ "$key3" == "~" ]]; then
+                        ((PAGE--))
+                        if ((PAGE < 0)); then PAGE=0; play_beep; fi
+                        draw_results_menu
+                    fi
+                    ;;
+                "[6") # Page Down
+                    read -rsn1 key3
+                    if [[ "$key3" == "~" ]]; then
+                        ((PAGE++))
+                        if ((PAGE >= MAX_PAGES)); then PAGE=$((MAX_PAGES - 1)); play_beep; fi
+                        draw_results_menu
+                    fi
+                    ;;
+            esac
+        else
+            # Handle regular keypresses
+            case "$key" in
+                '') # Enter key
+                    local idx=$((PAGE * RESULTS_PER_PAGE + CUR_INDEX))
+                    if (( idx < ${#TITLES[@]} )); then
+                        echo "Playing: ${TITLES[$idx]}"
+                        play_with_mpv "" "${URLS[$idx]}"
+                    fi
+                    ;;
+                [Ll]) # Shuffle and Play
+                    shuffle_and_play_downloads
+                    draw_results_menu
+                    ;;
+                [Dd]) # Download
+                    local idx=$((PAGE * RESULTS_PER_PAGE + CUR_INDEX))
+                    if (( idx < ${#TITLES[@]} )); then
+                        echo "Downloading: ${TITLES[$idx]}"
+                        if $AUDIO_ONLY_MODE; then
+                            yt-dlp -x --audio-format mp3 "${URLS[$idx]}"
+                        else
+                            yt-dlp -f 'bestvideo[height<=480]+bestaudio/best' --merge-output-format mp4 "${URLS[$idx]}"
+                        fi
+                    fi
+                    ;;
+                [Pp]) # Toggle Search Mode
+                    if [ "$SEARCH_TYPE" = "videos" ]; then
+                        SEARCH_TYPE="playlists"
+                    else
+                        SEARCH_TYPE="videos"
+                    fi
+                    save_state
+                    draw_results_menu
+                    ;;
+                [Cc]) # Cycle Audio Devices
+                    ((AUDIO_DEVICE_INDEX++))
+                    (( AUDIO_DEVICE_INDEX >= ${#AUDIO_DEVICES[@]} )) && AUDIO_DEVICE_INDEX=0
+                    save_state
+                    draw_results_menu
+                    ;;
+                [Ss]) # New Search
+                    new_search_from_results
+                    ;;
+                [Vv]) # Toggle Audio/Video Mode
+                    if $AUDIO_ONLY_MODE; then
+                        AUDIO_ONLY_MODE=false
+                    else
+                        AUDIO_ONLY_MODE=true
+                    fi
+                    save_state
+                    draw_results_menu
+                    ;;
+                $'\t') # Toggle Site
+                    if [ "$SITE" = "https://youtube.com" ]; then
+                        SITE="https://music.youtube.com"
+                    else
+                        SITE="https://youtube.com"
+                    fi
+                    save_state
+                    draw_results_menu
+                    ;;
+                [Qq]) # Quit
+                    stty sane
+                    echo "Quitting."
+                    save_state
+                    exit 0
+                    ;;
+            esac
+        fi
+    done
+}
+
+
+
+# Main execution
+check_and_install_dependencies
+generate_beep_file
+load_state
+detect_audio_devices
+results_menu
