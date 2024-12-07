@@ -298,7 +298,7 @@ draw_results_menu() {
     fi
 
     tput setab 7; tput setaf 0
-    echo "Site: $SITE"
+    echo "Site: $SITE   > ------- > by Page Telegram service for a better world. < -----"
     echo "Query: '$QUERY'"
     echo "Mode (SearchType): $SEARCH_TYPE"
     echo "Audio Device: $(get_audio_device_string)"
@@ -306,9 +306,9 @@ draw_results_menu() {
     echo "Page $page_num, $disp_start-$disp_end"
     echo "------------------------------------------------------------"
     tput sgr0
-    echo "Up/Down: Navigate items | PageUp/PageDown: Navigate pages | Enter: Play | D: Download | Q: Quit"
+    echo "Up/Down: Navigate items | Up/Down: Navigate pages | [ENTER]: Play | D: Download"
     echo "Tab: Toggle site | P: Toggle mode | C: Cycle audio device | S: New query"
-    echo "V: Toggle audio-only/video mode | L: Shuffle & play downloaded media"
+    echo "V: Toggle audio-only/video mode | L: Shuffle & play downloaded media | Q: Quit"
     echo "------------------------------------------------------------"
 
     for (( i = start_index; i <= end_index && i < ${#TITLES[@]}; i++ )); do
