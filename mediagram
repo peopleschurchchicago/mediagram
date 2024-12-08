@@ -4,8 +4,8 @@
 # Script Name: mediagram
 # Description:
 # This script provides an interactive terminal-based interface to search,
-# download and play YouTube videos using `yt-dlp` and `mpv.`
-#
+# download and play YouTube videos using `yt-dlp` and `mpv.` Forked for
+# Peoples Church of Chicago use.
 # Features:
 # - Search for YouTube videos or playlists with dynamic toggles.
 # - Supports audio-only or video playback modes.
