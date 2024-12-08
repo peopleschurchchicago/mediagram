@@ -15,7 +15,7 @@
 #
 # Attribution:
 # Implemented via GPT by Page Telegram services for a better world.
-# Version: v1.1 (added audio device 'default' option)
+# Version: v1.1 (added audio device 'default' option; also now redraws menu after song)
 # Date: December 2024
 # -------------------------------------------------------------------------
 
@@ -385,6 +385,7 @@ results_menu() {
                         echo "Playing: ${TITLES[$idx]}"
                         play_with_mpv "" "${URLS[$idx]}"
                     fi
+ draw_results_menu
                     ;;
                 [Ll]) # Shuffle and Play
                     shuffle_and_play_downloads
